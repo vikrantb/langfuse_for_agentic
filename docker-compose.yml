@@ -1,0 +1,170 @@
+services:
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment: &lf_env
+      NEXTAUTH_URL: http://localhost:3001   # CHANGED (was 3000)
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      SALT: "${SALT}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      TELEMETRY_ENABLED: "${TELEMETRY_ENABLED:-true}"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-true}"
+
+      # ClickHouse (OLAP)
+      CLICKHOUSE_MIGRATION_URL: "${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}"
+      CLICKHOUSE_URL: "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-clickhouse}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"
+      CLICKHOUSE_CLUSTER: ""
+      CLICKHOUSE_REPLICATION: "false"
+
+      # Redis
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_AUTH: "${REDIS_AUTH}"
+
+      # S3-compatible (MinIO) — internal endpoints only for the app
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse"
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: "auto"
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "${MINIO_ROOT_USER}"
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD}"
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "events/"
+
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "langfuse"
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: "auto"
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "${MINIO_ROOT_USER}"
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD}"
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: "media/"
+
+      # Optional batch export
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-false}"
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: "langfuse"
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: "exports/"
+      LANGFUSE_S3_BATCH_EXPORT_REGION: "auto"
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: "http://minio:9000"
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: "http://localhost:9090"
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: "${MINIO_ROOT_USER}"
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD}"
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+
+      # Email (optional)
+      EMAIL_FROM_ADDRESS: "${EMAIL_FROM_ADDRESS:-}"
+      SMTP_CONNECTION_URL: "${SMTP_CONNECTION_URL:-}"
+
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    restart: always
+    depends_on:
+      - langfuse-worker
+    ports:
+      - "127.0.0.1:3001:3000"     # CHANGED (was 3000:3000)
+    environment:
+      <<: *lf_env
+      NEXTAUTH_SECRET: "${NEXTAUTH_SECRET}"
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:24.3
+    restart: always
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      - ch_logs:/var/log/clickhouse-server
+      - ./clickhouse-config/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml:ro
+      - ./clickhouse-config/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./clickhouse-config/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro 
+    depends_on:
+      zookeeper:
+        condition: service_started     # <= changed from service_healthy
+    ports:
+      - "127.0.0.1:8124:8123"
+      - "127.0.0.1:9001:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  zookeeper:
+    image: docker.io/zookeeper:3.9
+    restart: always
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: ruok
+      ZOO_STANDALONE_ENABLED: "true"
+      ZOO_AUTOPURGE_PURGEINTERVAL: "1"
+    # (no healthcheck — avoids nc/curl issues inside the image)
+    # bind nothing to host; internal only
+
+  minio:
+    image: docker.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+    restart: always
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+    ports:
+      - "127.0.0.1:9090:9000"   # host S3 endpoint (debug)
+      - "127.0.0.1:9091:9001"   # MinIO console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 10s
+      retries: 10
+      start_period: 3s
+
+  redis:
+    image: docker.io/redis:7.2
+    restart: always
+    command: ["redis-server", "--requirepass", "${REDIS_AUTH}"]
+    ports:
+      - "127.0.0.1:6380:6379"     # CHANGED host port
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_AUTH}", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+      start_period: 3s
+
+  postgres:
+    image: docker.io/postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5433:5432"     # CHANGED host port
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  pg_data:
+  ch_data:
+  ch_logs:
+  minio_data:
